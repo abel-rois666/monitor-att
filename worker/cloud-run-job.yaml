@@ -1,0 +1,57 @@
+# Etapa 3: Manifiesto de despliegue para Cloud Run Job + Cloud Scheduler
+# IMPORTANTE:
+# - Un Cloud Run Job NO expone una URL HTTP pública.
+# - Se ejecuta por horario desde Cloud Scheduler invocando la API autenticada de Cloud Run v2
+#   usando OAuth2 con una Service Account dedicada (roles/run.invoker).
+# - Requiere un proyecto de Google Cloud propio con IAM habilitado (no Starter Tier sin IAM).
+apiVersion: run.googleapis.com/v1
+kind: Job
+metadata:
+  name: att-price-monitor-worker
+  annotations:
+    description: "Worker independiente Crawlee + Playwright para verificación controlada de precios y carrito en AT&T MX"
+spec:
+  template:
+    spec:
+      taskCount: 1
+      template:
+        spec:
+          maxRetries: 0
+          timeoutSeconds: 900
+          # IAM mínimo sugerido para att-monitor-worker-sa:
+          # - roles/datastore.user (escritura en Firestore)
+          # - roles/secretmanager.secretAccessor (lectura del secreto telegram-bot-token)
+          serviceAccountName: att-monitor-worker-sa@PROJECT_ID.iam.gserviceaccount.com
+          containers:
+            - image: REGION-docker.pkg.dev/PROJECT_ID/att-price-monitor/worker:latest
+              resources:
+                limits:
+                  cpu: "2"
+                  memory: "2Gi"
+              env:
+                - name: SCRAPER_LIVE_ENABLED
+                  value: "false"
+                - name: TARGET_CATALOG_URL
+                  value: "https://www.att.com.mx/market/destacados"
+                - name: MAX_REQUESTS_PER_MINUTE
+                  value: "6"
+                - name: MAX_PROBES_PER_VARIANT_PER_RUN
+                  value: "1"
+                # Opcional hasta Etapa 4 (cuando exista secreto en Secret Manager):
+                # - name: TELEGRAM_BOT_TOKEN
+                #   valueFrom:
+                #     secretKeyRef:
+                #       name: telegram-bot-token
+                #       key: latest
+# ------------------------------------------------------------------------------
+# Invocación programada mediante Cloud Scheduler + API autenticada de Cloud Run v2
+# IAM mínimo para att-monitor-scheduler-sa: roles/run.invoker sobre el Job
+# ------------------------------------------------------------------------------
+# gcloud scheduler jobs create http att-price-monitor-schedule \
+#   --location=REGION \
+#   --schedule="*/30 * * * *" \
+#   --time-zone="America/Mexico_City" \
+#   --uri="https://REGION-run.googleapis.com/v2/projects/PROJECT_ID/locations/REGION/jobs/att-price-monitor-worker:run" \
+#   --http-method=POST \
+#   --oauth-service-account-email="att-monitor-scheduler-sa@PROJECT_ID.iam.gserviceaccount.com" \
+#   --oauth-token-scope="https://www.googleapis.com/auth/cloud-platform"

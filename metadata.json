@@ -1,0 +1,6 @@
+{
+  "name": "AT&T Price Monitor",
+  "description": "Plataforma full-stack para monitorear precios, rebajas, disponibilidad real con verificación de carrito y alertas Telegram de celulares en AT&T México.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,279 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Root workspace profile document anchoring user-scoped favorites, alert rules, and Telegram channel metadata without storing PII.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Firebase Auth UID matching the document path."
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "description": "Short display label shown in the monitoring workspace."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp set at profile creation."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp set on profile update."
+        }
+      },
+      "required": ["uid", "displayName", "createdAt", "updatedAt"]
+    },
+    "FavoriteVariant": {
+      "title": "FavoriteVariant",
+      "description": "A monitored smartphone variant bookmarked by a user with an optional MXN target price threshold.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Owner Firebase Auth UID."
+        },
+        "variantId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Catalog variant identifier."
+        },
+        "productName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 140,
+          "description": "Human-readable smartphone model name."
+        },
+        "brand": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60,
+          "description": "Device manufacturer brand."
+        },
+        "storage": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40,
+          "description": "Storage capacity label."
+        },
+        "color": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60,
+          "description": "Variant finish or color."
+        },
+        "targetPriceMxn": {
+          "type": "number",
+          "description": "Optional target price threshold in MXN (0 means unset)."
+        },
+        "notes": {
+          "type": "string",
+          "maxLength": 240,
+          "description": "Optional user tracking note."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp set on creation."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp set on update."
+        }
+      },
+      "required": [
+        "ownerId",
+        "variantId",
+        "productName",
+        "brand",
+        "storage",
+        "color",
+        "targetPriceMxn",
+        "notes",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "AlertRule": {
+      "title": "AlertRule",
+      "description": "User-configured notification rule for price drops, verified restocks, or false-positive stock button warnings.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Owner Firebase Auth UID."
+        },
+        "name": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 120,
+          "description": "Rule label."
+        },
+        "scope": {
+          "type": "string",
+          "enum": ["all_favorites", "specific_variant", "entire_catalog"],
+          "description": "Evaluation scope for the rule."
+        },
+        "variantId": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Target variant ID when scope is specific_variant, or empty string."
+        },
+        "triggerType": {
+          "type": "string",
+          "enum": [
+            "price_drop_percent",
+            "target_price_mxn",
+            "verified_restock",
+            "false_positive_warning"
+          ],
+          "description": "Condition that fires the Telegram alert."
+        },
+        "thresholdValue": {
+          "type": "number",
+          "description": "Percentage drop (1-90) or MXN price threshold (0 for stock-only triggers)."
+        },
+        "enabled": {
+          "type": "boolean",
+          "description": "Whether the rule is active."
+        },
+        "cooldownMinutes": {
+          "type": "number",
+          "description": "Minimum minutes between repeated alerts (5 to 1440)."
+        },
+        "requireCartVerification": {
+          "type": "boolean",
+          "description": "Must confirm stock via permitted cart probe before notifying availability."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp set on creation."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp set on update."
+        }
+      },
+      "required": [
+        "ownerId",
+        "name",
+        "scope",
+        "variantId",
+        "triggerType",
+        "thresholdValue",
+        "enabled",
+        "cooldownMinutes",
+        "requireCartVerification",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "TelegramSettings": {
+      "title": "TelegramSettings",
+      "description": "Non-secret Telegram destination metadata (Chat ID, topic ID, quiet hours). Bot token is strictly managed as a server/Cloud Run secret.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Owner Firebase Auth UID."
+        },
+        "chatId": {
+          "type": "string",
+          "maxLength": 64,
+          "pattern": "^(-?[0-9]{0,32}|@[a-zA-Z0-9_]{0,60})$",
+          "description": "Telegram Chat ID or @channel handle."
+        },
+        "topicId": {
+          "type": "string",
+          "maxLength": 32,
+          "pattern": "^[0-9]{0,20}$",
+          "description": "Optional Telegram forum thread/topic ID."
+        },
+        "channelLabel": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
+          "description": "Friendly name for the destination channel."
+        },
+        "quietHoursEnabled": {
+          "type": "boolean",
+          "description": "Suppresses alerts during configured night hours."
+        },
+        "quietStartHour": {
+          "type": "number",
+          "description": "Start hour (0-23) in America/Mexico_City."
+        },
+        "quietEndHour": {
+          "type": "number",
+          "description": "End hour (0-23) in America/Mexico_City."
+        },
+        "dispatchMode": {
+          "type": "string",
+          "enum": ["preview_only", "cloud_run_worker"],
+          "description": "Execution mode; preview_only until Cloud Run worker is deployed."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp set on creation."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp set on update."
+        }
+      },
+      "required": [
+        "ownerId",
+        "chatId",
+        "topicId",
+        "channelLabel",
+        "quietHoursEnabled",
+        "quietStartHour",
+        "quietEndHour",
+        "dispatchMode",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Owner-only workspace root document (no PII stored)."
+    },
+    "/users/{userId}/favorites/{variantId}": {
+      "schema": { "$ref": "#/entities/FavoriteVariant" },
+      "description": "User's favorited smartphone variants and MXN target prices."
+    },
+    "/users/{userId}/alertRules/{ruleId}": {
+      "schema": { "$ref": "#/entities/AlertRule" },
+      "description": "User's Telegram alert rule definitions."
+    },
+    "/users/{userId}/telegramSettings/{settingId}": {
+      "schema": { "$ref": "#/entities/TelegramSettings" },
+      "description": "User's non-secret Telegram destination configuration (singleton doc 'default')."
+    }
+  }
+}

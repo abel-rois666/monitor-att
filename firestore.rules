@@ -1,0 +1,272 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // -------------------------------------------------------------------------
+    // Global Hardened Primitives
+    // -------------------------------------------------------------------------
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isVerifiedOwner(userId) {
+      return isVerifiedUser() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function hasParentWorkspace(userId) {
+      return exists(/databases/$(database)/documents/users/$(userId));
+    }
+
+    // -------------------------------------------------------------------------
+    // Entity Validation Blueprints (synchronized with firebase-blueprint.json)
+    // -------------------------------------------------------------------------
+    function isValidUserProfile(data, userId) {
+      return data.keys().hasAll(['uid', 'displayName', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'displayName', 'createdAt', 'updatedAt'])
+        && isValidId(data.uid)
+        && data.uid == request.auth.uid
+        && data.uid == userId
+        && data.displayName is string
+        && data.displayName.size() >= 1
+        && data.displayName.size() <= 100
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidFavoriteVariant(data, userId, variantId) {
+      return data.keys().hasAll([
+          'ownerId', 'variantId', 'productName', 'brand',
+          'storage', 'color', 'targetPriceMxn', 'notes', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId', 'variantId', 'productName', 'brand',
+          'storage', 'color', 'targetPriceMxn', 'notes', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.ownerId)
+        && data.ownerId == request.auth.uid
+        && data.ownerId == userId
+        && isValidId(data.variantId)
+        && data.variantId == variantId
+        && data.productName is string && data.productName.size() >= 1 && data.productName.size() <= 140
+        && data.brand is string && data.brand.size() >= 1 && data.brand.size() <= 60
+        && data.storage is string && data.storage.size() >= 1 && data.storage.size() <= 40
+        && data.color is string && data.color.size() >= 1 && data.color.size() <= 60
+        && data.targetPriceMxn is number && data.targetPriceMxn >= 0 && data.targetPriceMxn <= 250000
+        && data.notes is string && data.notes.size() <= 240
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidAlertRule(data, userId) {
+      return data.keys().hasAll([
+          'ownerId', 'name', 'scope', 'variantId', 'triggerType',
+          'thresholdValue', 'enabled', 'cooldownMinutes',
+          'requireCartVerification', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId', 'name', 'scope', 'variantId', 'triggerType',
+          'thresholdValue', 'enabled', 'cooldownMinutes',
+          'requireCartVerification', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.ownerId)
+        && data.ownerId == request.auth.uid
+        && data.ownerId == userId
+        && data.name is string && data.name.size() >= 2 && data.name.size() <= 120
+        && data.scope is string && data.scope in ['all_favorites', 'specific_variant', 'entire_catalog']
+        && data.variantId is string && data.variantId.size() <= 128
+        && (data.scope != 'specific_variant' || isValidId(data.variantId))
+        && data.triggerType is string && data.triggerType in [
+          'price_drop_percent', 'target_price_mxn', 'verified_restock', 'false_positive_warning'
+        ]
+        && data.thresholdValue is number && data.thresholdValue >= 0 && data.thresholdValue <= 250000
+        && data.enabled is bool
+        && data.cooldownMinutes is number && data.cooldownMinutes >= 5 && data.cooldownMinutes <= 1440
+        && data.requireCartVerification is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidTelegramSettings(data, userId) {
+      return data.keys().hasAll([
+          'ownerId', 'chatId', 'topicId', 'channelLabel',
+          'quietHoursEnabled', 'quietStartHour', 'quietEndHour',
+          'dispatchMode', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId', 'chatId', 'topicId', 'channelLabel',
+          'quietHoursEnabled', 'quietStartHour', 'quietEndHour',
+          'dispatchMode', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.ownerId)
+        && data.ownerId == request.auth.uid
+        && data.ownerId == userId
+        && data.chatId is string && data.chatId.size() <= 64 && data.chatId.matches('^(-?[0-9]{0,32}|@[a-zA-Z0-9_]{0,60})$')
+        && data.topicId is string && data.topicId.size() <= 32 && data.topicId.matches('^[0-9]{0,20}$')
+        && data.channelLabel is string && data.channelLabel.size() >= 1 && data.channelLabel.size() <= 80
+        && data.quietHoursEnabled is bool
+        && data.quietStartHour is number && data.quietStartHour >= 0 && data.quietStartHour <= 23
+        && data.quietEndHour is number && data.quietEndHour >= 0 && data.quietEndHour <= 23
+        && data.dispatchMode is string && data.dispatchMode in ['preview_only', 'cloud_run_worker']
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // -------------------------------------------------------------------------
+    // Collection: /users/{userId}
+    // -------------------------------------------------------------------------
+    match /users/{userId} {
+      allow get: if isValidId(userId) && isOwner(userId);
+      allow list: if false;
+
+      allow create: if isVerifiedOwner(userId)
+        && isValidId(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedOwner(userId)
+        && isValidId(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'updatedAt']);
+
+      allow delete: if false;
+
+      // -----------------------------------------------------------------------
+      // Subcollection: /users/{userId}/favorites/{variantId}
+      // -----------------------------------------------------------------------
+      match /favorites/{variantId} {
+        allow get: if isValidId(userId) && isValidId(variantId) && isOwner(userId);
+        allow list: if isOwner(userId) && resource.data.ownerId == request.auth.uid;
+
+        allow create: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidId(variantId)
+          && isValidFavoriteVariant(incoming(), userId, variantId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && hasParentWorkspace(userId);
+
+        allow update: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidId(variantId)
+          && isValidFavoriteVariant(incoming(), userId, variantId)
+          && incoming().ownerId == existing().ownerId
+          && incoming().variantId == existing().variantId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && (
+            incoming().diff(existing()).affectedKeys().hasOnly(['targetPriceMxn', 'updatedAt'])
+            || incoming().diff(existing()).affectedKeys().hasOnly(['notes', 'updatedAt'])
+            || incoming().diff(existing()).affectedKeys().hasOnly(['targetPriceMxn', 'notes', 'updatedAt'])
+          )
+          && hasParentWorkspace(userId);
+
+        allow delete: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidId(variantId)
+          && existing().ownerId == request.auth.uid
+          && hasParentWorkspace(userId);
+      }
+
+      // -----------------------------------------------------------------------
+      // Subcollection: /users/{userId}/alertRules/{ruleId}
+      // -----------------------------------------------------------------------
+      match /alertRules/{ruleId} {
+        allow get: if isValidId(userId) && isValidId(ruleId) && isOwner(userId);
+        allow list: if isOwner(userId) && resource.data.ownerId == request.auth.uid;
+
+        allow create: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidId(ruleId)
+          && isValidAlertRule(incoming(), userId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && hasParentWorkspace(userId);
+
+        allow update: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidId(ruleId)
+          && isValidAlertRule(incoming(), userId)
+          && incoming().ownerId == existing().ownerId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && (
+            incoming().diff(existing()).affectedKeys().hasOnly(['enabled', 'updatedAt'])
+            || incoming().diff(existing()).affectedKeys().hasOnly([
+              'name', 'scope', 'variantId', 'triggerType', 'thresholdValue',
+              'cooldownMinutes', 'requireCartVerification', 'enabled', 'updatedAt'
+            ])
+          )
+          && hasParentWorkspace(userId);
+
+        allow delete: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidId(ruleId)
+          && existing().ownerId == request.auth.uid
+          && hasParentWorkspace(userId);
+      }
+
+      // -----------------------------------------------------------------------
+      // Subcollection: /users/{userId}/telegramSettings/{settingId}
+      // Singleton document: settingId == 'default'
+      // -----------------------------------------------------------------------
+      match /telegramSettings/{settingId} {
+        allow get: if isValidId(userId) && settingId == 'default' && isOwner(userId);
+        allow list: if false;
+
+        allow create: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && settingId == 'default'
+          && isValidTelegramSettings(incoming(), userId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && hasParentWorkspace(userId);
+
+        allow update: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && settingId == 'default'
+          && isValidTelegramSettings(incoming(), userId)
+          && incoming().ownerId == existing().ownerId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'chatId', 'topicId', 'channelLabel',
+            'quietHoursEnabled', 'quietStartHour', 'quietEndHour',
+            'dispatchMode', 'updatedAt'
+          ])
+          && hasParentWorkspace(userId);
+
+        allow delete: if false;
+      }
+    }
+  }
+}
