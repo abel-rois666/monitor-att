@@ -91,6 +91,7 @@ export function buildRealObservationRecord(params: {
         contentType: sig.contentType,
         isReservationRejection: sig.isReservationRejection,
         isReservationConfirmed: sig.isReservationConfirmed,
+        confirmedVariantInCart: sig.confirmedVariantInCart,
         detectedCartItemCount: sig.detectedCartItemCount,
         detectedOutOfStockMessage: sig.detectedOutOfStockMessage,
         observedAtMs: sig.observedAtMs,

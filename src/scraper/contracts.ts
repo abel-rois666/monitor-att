@@ -33,6 +33,7 @@ export type AvailabilityClassificationReason =
   | 'EXPLICIT_OUT_OF_STOCK_WITH_MATCHED_SKU'
   | 'RESERVATION_REJECTED'
   | 'CONFIRMED_RESERVATION_AND_CART'
+  | 'CART_COUNTER_ONLY_UNVERIFIED'
   | 'UNCORRELATED_SKU'
   | 'ENABLED_BUTTON_UNVERIFIED'
   | 'DISABLED_BUTTON_WITHOUT_OUT_OF_STOCK_MESSAGE'
@@ -43,6 +44,14 @@ export type AvailabilityClassificationReason =
   | 'TIMEOUT'
   | 'NETWORK_OR_ACCESS_ERROR'
   | 'INCONCLUSIVE_INTERACTION';
+
+export type HydrationOutcomeStatus =
+  | 'elements_found'
+  | 'loaded_no_matches'
+  | 'incomplete_hydration'
+  | 'timeout'
+  | 'network_error'
+  | 'access_denied';
 
 export type ExtractionStatus =
   | 'ok'
@@ -94,6 +103,7 @@ export const DEFAULT_COMPLIANCE_POLICY: ComplianceGuardConfig = {
  * Sirven únicamente como metadatos de verificación; nunca representan existencias actuales.
  */
 export interface ReferenceProductCase {
+  readonly alias: 's23-ultra' | 'honor-magic6-pro';
   readonly productId: string;
   readonly productName: string;
   readonly variantId: string;
@@ -105,6 +115,7 @@ export interface ReferenceProductCase {
 
 export const ATT_REFERENCE_PRODUCTS: readonly ReferenceProductCase[] = [
   {
+    alias: 's23-ultra',
     productId: 'BF_GALAXY_S23_ULTRA',
     productName: 'Samsung Galaxy S23 Ultra 512 GB',
     variantId: 'BF_N.S23U512BK',
@@ -116,6 +127,7 @@ export const ATT_REFERENCE_PRODUCTS: readonly ReferenceProductCase[] = [
       'Caso confirmado en inspección manual: SKU coincidente + HTTP 422 en reserva + mensaje explícito de agotamiento en la misma interacción.',
   },
   {
+    alias: 'honor-magic6-pro',
     productId: 'BF_BUNDLE_HONOR_MAGIC6_PRO',
     productName: 'HONOR Magic6 Pro 512 GB',
     variantId: 'BF_N.M6PBPX9B',
@@ -184,6 +196,7 @@ export interface StructuredNetworkSignal {
   readonly contentType: string;
   readonly isReservationRejection: boolean;
   readonly isReservationConfirmed: boolean;
+  readonly confirmedVariantInCart: boolean;
   readonly detectedCartItemCount: number | null;
   readonly detectedOutOfStockMessage: string | null;
   readonly observedAtMs: number;
@@ -208,6 +221,20 @@ export interface SkuCorrelationResult {
   readonly notes: string;
 }
 
+/**
+ * Verificación estricta de limpieza posterior a una sonda de carrito.
+ * `cartClearedAfterProbe` solo puede ser `true` cuando se comprueba positivamente
+ * que el artículo correspondiente a la variante dejó de existir en el carrito.
+ */
+export interface CartCleanupVerification {
+  readonly removalAttempted: boolean;
+  readonly variantPresentBeforeRemoval: boolean;
+  readonly variantPresentAfterRemoval: boolean | null;
+  readonly removalApiConfirmed: boolean;
+  readonly cartClearedAfterProbe: boolean;
+  readonly notes: string;
+}
+
 export interface AvailabilityEvidence {
   readonly method: EvidenceMethod;
   readonly buttonState: AddToCartButtonState;
@@ -217,6 +244,7 @@ export interface AvailabilityEvidence {
   readonly httpStatus: number | null;
   readonly backendStatus: number | null;
   readonly cartClearedAfterProbe: boolean;
+  readonly cartCleanupVerification?: CartCleanupVerification;
   readonly notes: string;
 }
 
@@ -249,7 +277,10 @@ export interface RealExtractionRunReport {
   readonly schemaVersion: '2.1';
   readonly dataOrigin: ObservationDataOrigin;
   readonly runId: string;
-  readonly mode: 'read_only_discovery' | 'supervised_single_cart_probe';
+  readonly mode:
+    | 'read_only_discovery'
+    | 'read_only_single_product'
+    | 'supervised_single_cart_probe';
   readonly targetCatalogUrl: string;
   readonly startedAtIso: string;
   readonly finishedAtIso: string;
@@ -265,6 +296,25 @@ export interface RealExtractionRunReport {
     readonly errors: number;
   };
   readonly observations: RealObservationRecord[];
+}
+
+export interface SingleProductPriceInspectionReport {
+  readonly mode: 'read_only_single_product';
+  readonly executedNetworkRequest: boolean;
+  readonly productUrl: string;
+  readonly productId: string | null;
+  readonly selectedVariantId: string | null;
+  readonly title: string | null;
+  readonly rawPriceText: string | null;
+  readonly currentPriceMxn: number | null;
+  readonly availabilityState: 'UNKNOWN';
+  readonly hydrationStatus: HydrationOutcomeStatus | 'not_executed';
+  readonly blockedByConfiguration: boolean;
+  readonly blockedReason: string | null;
+  readonly missingProductDetailSelectors: string[];
+  readonly selectorSource: string;
+  readonly observedAtIso: string;
+  readonly notes: string;
 }
 
 export interface SupervisedProbeAuthorization {
@@ -312,6 +362,7 @@ export interface CartVerificationResult {
   readonly correlation: SkuCorrelationResult;
   readonly structuredSignals: StructuredNetworkSignal[];
   readonly cartClearedAfterProbe: boolean;
+  readonly cartCleanupVerification: CartCleanupVerification;
   readonly verifiedAtIso: string;
   readonly extractionStatus: ExtractionStatus;
   readonly errorMessage?: string;

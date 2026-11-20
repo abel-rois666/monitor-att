@@ -1,18 +1,20 @@
 {
   "name": "att-price-monitor-worker",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
-  "description": "Worker independiente Crawlee + Playwright para descubrimiento y verificación controlada de disponibilidad en AT&T México (Cloud Run Jobs).",
+  "description": "Worker independiente Crawlee + Playwright para inspección de solo lectura y verificación controlada de disponibilidad en AT&T México (Cloud Run Jobs).",
   "scripts": {
+    "status": "tsx src/index.ts --mode=status",
+    "inspect:product": "tsx src/index.ts --mode=inspect-product",
+    "inspect:hydration": "tsx src/index.ts --mode=inspect-hydration",
     "start": "tsx src/index.ts --mode=discover-readonly",
-    "probe:supervised": "tsx src/index.ts --mode=supervised-cart-probe",
-    "status": "tsx src/index.ts --mode=status"
+    "probe:supervised": "tsx src/index.ts --mode=supervised-cart-probe"
   },
   "dependencies": {
     "crawlee": "^3.13.0",
     "dotenv": "^17.2.3",
-    "playwright": "^1.52.0",
+    "playwright": "1.52.0",
     "tsx": "^4.21.0"
   },
   "devDependencies": {

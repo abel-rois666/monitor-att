@@ -1,0 +1,67 @@
+{
+  "$comment": "Plantilla de selectores externos para AT&T Price Monitor. Copia este archivo a worker/config/selectors.json (o pásalo con --selectors-file / ATT_SELECTORS_FILE) ÚNICAMENTE con selectores comprobados con Playwright. Cada grupo se valida de forma independiente.",
+  "groups": {
+    "catalog": {
+      "validated": false,
+      "validatedAtIso": null,
+      "validatedBy": null
+    },
+    "productDetail": {
+      "validated": false,
+      "validatedAtIso": null,
+      "validatedBy": null
+    },
+    "cartProbe": {
+      "validated": false,
+      "validatedAtIso": null,
+      "validatedBy": null
+    }
+  },
+  "priceCandidates": {
+    "title": {
+      "selector": "[class*=\"brandArea\"] h2",
+      "status": "unvalidated_candidate",
+      "lastPlaywrightMatchCount": 0,
+      "notes": "Pendiente comprobar visibilidad real en DOM hidratado de Next.js con Playwright."
+    },
+    "currentPrice": {
+      "selector": "[class*=\"currentPrice\"]",
+      "status": "unvalidated_candidate",
+      "lastPlaywrightMatchCount": 0,
+      "notes": "Pendiente comprobar visibilidad real en DOM hidratado de Next.js con Playwright."
+    },
+    "pricingArea": {
+      "selector": "[class*=\"pricingArea\"]",
+      "status": "unvalidated_candidate",
+      "lastPlaywrightMatchCount": 0,
+      "notes": "Pendiente comprobar visibilidad real en DOM hidratado de Next.js con Playwright."
+    }
+  },
+  "catalog": {
+    "productCardContainer": null,
+    "productCardTitle": null,
+    "productCardPrice": null,
+    "productCardBrand": null,
+    "productDetailLink": null,
+    "paginationNextTrigger": null
+  },
+  "productDetail": {
+    "titleElement": null,
+    "brandElement": null,
+    "priceElement": null,
+    "listPriceElement": null,
+    "storageOptionGroup": null,
+    "colorOptionGroup": null,
+    "addToCartButton": null,
+    "explicitOutOfStockBadge": null
+  },
+  "cartProbe": {
+    "outOfStockToastOrModal": null,
+    "outOfStockExpectedPhrase": "Este producto se agotó",
+    "outOfStockFullMessage": "¡No te quedes sin estrenar! Este producto se agotó, pero hay más opciones que podrían encantarte.",
+    "cartSuccessIndicator": null,
+    "cartCounterBadge": null,
+    "cartItemVariantLocator": null,
+    "removeFromCartButton": null
+  }
+}

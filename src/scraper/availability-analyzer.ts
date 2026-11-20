@@ -3,6 +3,7 @@ import {
   mapScraperStateToUiAvailability,
   type AvailabilityClassificationReason,
   type AvailabilityEvidence,
+  type CartCleanupVerification,
   type CartVerificationResult,
   type ExtractionStatus,
   type RealObservationRecord,
@@ -263,6 +264,7 @@ export function inspectStructuredNetworkPayload(params: {
     explicitErrorText: string | null;
     explicitInStockBool: boolean | null;
     hasExplicitReservationSuccessKey: boolean;
+    hasExplicitCartAddedKey: boolean;
   } = {
     backendPathOnly: null,
     backendStatus: null,
@@ -272,6 +274,7 @@ export function inspectStructuredNetworkPayload(params: {
     explicitErrorText: null,
     explicitInStockBool: null,
     hasExplicitReservationSuccessKey: false,
+    hasExplicitCartAddedKey: false,
   };
 
   const visit = (node: unknown, depth: number): void => {
@@ -330,13 +333,29 @@ export function inspectStructuredNetworkPayload(params: {
 
         if (
           typeof value === 'boolean' &&
-          ['instock', 'in_stock', 'available', 'reserved', 'reservationconfirmed'].includes(lowerKey)
+          [
+            'instock',
+            'in_stock',
+            'available',
+            'reserved',
+            'reservationconfirmed',
+            'added',
+            'itemadded',
+          ].includes(lowerKey)
         ) {
           matchedSafeKeys.push(rawKey);
           if (lowerKey === 'reserved' || lowerKey === 'reservationconfirmed') {
             if (value === true) state.hasExplicitReservationSuccessKey = true;
           }
-          if (state.explicitInStockBool === null || value === false) {
+          if (lowerKey === 'added' || lowerKey === 'itemadded') {
+            if (value === true) state.hasExplicitCartAddedKey = true;
+          }
+          if (
+            ['instock', 'in_stock', 'available', 'reserved', 'reservationconfirmed'].includes(
+              lowerKey
+            ) &&
+            (state.explicitInStockBool === null || value === false)
+          ) {
             state.explicitInStockBool = value;
           }
           continue;
@@ -392,13 +411,25 @@ export function inspectStructuredNetworkPayload(params: {
       effectiveBackendStatus === 409 ||
       Boolean(state.explicitErrorText && /rechaz|reserva/i.test(state.explicitErrorText)));
 
+  // Regla estricta: un contador general (`cartCount`) por sí solo NO confirma reserva ni disponibilidad.
   const isReservationConfirmed =
     !isReservationRejection &&
     !isCartSyncPath &&
-    (operationKind === 'stock_reserve' || operationKind === 'cart_update') &&
+    Boolean(state.extractedSku) &&
+    operationKind === 'stock_reserve' &&
     effectiveBackendStatus >= 200 &&
     effectiveBackendStatus < 300 &&
-    (state.hasExplicitReservationSuccessKey ||
+    (state.hasExplicitReservationSuccessKey || state.explicitInStockBool === true);
+
+  // Confirmación de alta en carrito vinculada específicamente a un SKU identificado
+  const confirmedVariantInCart =
+    !isReservationRejection &&
+    !isCartSyncPath &&
+    Boolean(state.extractedSku) &&
+    operationKind === 'cart_update' &&
+    effectiveBackendStatus >= 200 &&
+    effectiveBackendStatus < 300 &&
+    (state.hasExplicitCartAddedKey ||
       state.explicitInStockBool === true ||
       (state.detectedCartItemCount !== null && state.detectedCartItemCount > 0));
 
@@ -422,6 +453,7 @@ export function inspectStructuredNetworkPayload(params: {
     contentType: params.contentType,
     isReservationRejection,
     isReservationConfirmed,
+    confirmedVariantInCart,
     detectedCartItemCount: state.detectedCartItemCount,
     detectedOutOfStockMessage: state.detectedOutOfStockMessage,
     observedAtMs: params.observedAtMs ?? Date.now(),
@@ -600,16 +632,92 @@ export function analyzeReadOnlyAvailability(
   };
 }
 
+/**
+ * Evalúa la limpieza posterior a una sonda de carrito.
+ * Regla estricta: jamás marca `cartClearedAfterProbe=true` por el mero clic en eliminar;
+ * exige confirmación verificable de que el artículo de la variante específica desapareció del carrito.
+ */
+export function verifyCartCleanupResult(params: {
+  removalAttempted: boolean;
+  variantPresentBeforeRemoval: boolean;
+  variantPresentAfterRemoval: boolean | null;
+  removalApiConfirmed?: boolean;
+}): CartCleanupVerification {
+  const removalApiConfirmed = Boolean(params.removalApiConfirmed);
+
+  if (!params.removalAttempted) {
+    return {
+      removalAttempted: false,
+      variantPresentBeforeRemoval: params.variantPresentBeforeRemoval,
+      variantPresentAfterRemoval: params.variantPresentAfterRemoval,
+      removalApiConfirmed,
+      cartClearedAfterProbe: false,
+      notes: 'No se ejecutó limpieza de carrito.',
+    };
+  }
+
+  if (params.variantPresentAfterRemoval === null) {
+    return {
+      removalAttempted: true,
+      variantPresentBeforeRemoval: params.variantPresentBeforeRemoval,
+      variantPresentAfterRemoval: null,
+      removalApiConfirmed,
+      cartClearedAfterProbe: false,
+      notes:
+        'Se hizo clic en eliminar, pero no se verificó la desaparición del artículo específico en el carrito; cartClearedAfterProbe permanece false.',
+    };
+  }
+
+  if (params.variantPresentAfterRemoval === true) {
+    return {
+      removalAttempted: true,
+      variantPresentBeforeRemoval: params.variantPresentBeforeRemoval,
+      variantPresentAfterRemoval: true,
+      removalApiConfirmed,
+      cartClearedAfterProbe: false,
+      notes:
+        'La variante seguía presente en el carrito tras intentar eliminarla; limpieza NO confirmada.',
+    };
+  }
+
+  if (!params.variantPresentBeforeRemoval && !removalApiConfirmed) {
+    return {
+      removalAttempted: true,
+      variantPresentBeforeRemoval: false,
+      variantPresentAfterRemoval: false,
+      removalApiConfirmed: false,
+      cartClearedAfterProbe: false,
+      notes:
+        'No existía evidencia previa de presencia de la variante ni confirmación de eliminación en backend; limpieza no concluyente.',
+    };
+  }
+
+  return {
+    removalAttempted: true,
+    variantPresentBeforeRemoval: params.variantPresentBeforeRemoval,
+    variantPresentAfterRemoval: false,
+    removalApiConfirmed,
+    cartClearedAfterProbe: true,
+    notes:
+      'Eliminación verificada: se comprobó que el artículo de la variante específica desapareció del carrito.',
+  };
+}
+
 export interface SupervisedCartProbeInput {
   readonly productId: string;
   readonly selectedVariantId: string;
   readonly interactionStartedAtMs: number;
   readonly buttonState: AddToCartButtonState;
   readonly uiFeedback: UiFeedbackObservation | null;
-  readonly cartSuccessConfirmedInUi: boolean;
+  /** Confirmación específica de que la variante/SKU investigada aparece en el detalle del carrito. */
+  readonly cartContainsSelectedVariant: boolean;
+  /** Indicador visual genérico de carrito (informativo; insuficiente por sí solo para IN_STOCK). */
+  readonly cartSuccessConfirmedInUi?: boolean;
+  /** Contadores generales del encabezado (informativos; NUNCA bastan como única evidencia). */
   readonly cartCountBefore: number | null;
   readonly cartCountAfter: number | null;
-  readonly cartClearedAfterProbe: boolean;
+  /** Resultado verificado de limpieza del carrito (reemplaza el booleano ciego post-clic). */
+  readonly cartCleanup?: CartCleanupVerification;
   readonly structuredSignals?: StructuredNetworkSignal[];
   readonly verifiedBundleMappings?: readonly VerifiedBundleSkuMapping[];
   readonly httpStatus?: number | null;
@@ -649,13 +757,27 @@ export function assertSupervisedProbeAuthorized(
 /**
  * Evaluador de la interacción supervisada de 6 pasos:
  * 1. productId -> 2. selectedVariantId -> 3. operationSku -> 4. solicitud de reserva
- * -> 5. respuesta del backend -> 6. mensaje visual de la misma interacción.
+ * -> 5. respuesta del backend -> 6. mensaje visual / presencia específica en carrito y limpieza verificada.
  */
 export function evaluateSupervisedCartProbe(
   input: SupervisedCartProbeInput,
   verifiedAtIso: string = new Date().toISOString()
 ): CartVerificationResult {
   const allSignals = input.structuredSignals ?? [];
+  const cleanupVerification = input.cartCleanup
+    ? verifyCartCleanupResult({
+        removalAttempted: input.cartCleanup.removalAttempted,
+        variantPresentBeforeRemoval: input.cartCleanup.variantPresentBeforeRemoval,
+        variantPresentAfterRemoval: input.cartCleanup.variantPresentAfterRemoval,
+        removalApiConfirmed: input.cartCleanup.removalApiConfirmed,
+      })
+    : verifyCartCleanupResult({
+        removalAttempted: false,
+        variantPresentBeforeRemoval: false,
+        variantPresentAfterRemoval: null,
+        removalApiConfirmed: false,
+      });
+
   const defaultCorrelation: SkuCorrelationResult = {
     matched: false,
     matchType: 'missing_sku',
@@ -686,6 +808,7 @@ export function evaluateSupervisedCartProbe(
       correlation: defaultCorrelation,
       structuredSignals: allSignals,
       cartClearedAfterProbe: false,
+      cartCleanupVerification: cleanupVerification,
       verifiedAtIso,
       extractionStatus: input.error.status,
       errorMessage: input.error.message,
@@ -708,6 +831,7 @@ export function evaluateSupervisedCartProbe(
       correlation: defaultCorrelation,
       structuredSignals: allSignals,
       cartClearedAfterProbe: false,
+      cartCleanupVerification: cleanupVerification,
       verifiedAtIso,
       extractionStatus: blocked ? 'blocked' : 'error',
       errorMessage: `HTTP ${input.httpStatus} durante la interacción.`,
@@ -730,6 +854,7 @@ export function evaluateSupervisedCartProbe(
       correlation: defaultCorrelation,
       structuredSignals: allSignals,
       cartClearedAfterProbe: false,
+      cartCleanupVerification: cleanupVerification,
       verifiedAtIso,
       extractionStatus: 'ok',
     };
@@ -763,6 +888,7 @@ export function evaluateSupervisedCartProbe(
       },
       structuredSignals: allSignals,
       cartClearedAfterProbe: false,
+      cartCleanupVerification: cleanupVerification,
       verifiedAtIso,
       extractionStatus: 'ok',
     };
@@ -802,6 +928,7 @@ export function evaluateSupervisedCartProbe(
   const primaryMatchedSignal = matchedSignals[0] ?? null;
   const matchedRejectionSignal = matchedSignals.find((s) => s.isReservationRejection) ?? null;
   const matchedConfirmationSignal = matchedSignals.find((s) => s.isReservationConfirmed) ?? null;
+  const matchedCartItemSignal = matchedSignals.find((s) => s.confirmedVariantInCart) ?? null;
 
   // 5a. Si hubo operaciones de reserva/carrito pero NINGUNA corresponde al SKU investigado -> UNKNOWN (no modifica estado)
   if (inventorySignals.length > 0 && matchedSignals.length === 0) {
@@ -819,6 +946,7 @@ export function evaluateSupervisedCartProbe(
       correlation: bestCorrelation,
       structuredSignals: postClickSignals,
       cartClearedAfterProbe: false,
+      cartCleanupVerification: cleanupVerification,
       verifiedAtIso,
       extractionStatus: 'ok',
       errorMessage: bestCorrelation.notes,
@@ -849,7 +977,8 @@ export function evaluateSupervisedCartProbe(
         detectedFeedbackMessage: detectedMsg,
         correlation: bestCorrelation,
         structuredSignals: postClickSignals,
-        cartClearedAfterProbe: input.cartClearedAfterProbe,
+        cartClearedAfterProbe: cleanupVerification.cartClearedAfterProbe,
+        cartCleanupVerification: cleanupVerification,
         verifiedAtIso,
         extractionStatus: 'ok',
       };
@@ -869,7 +998,8 @@ export function evaluateSupervisedCartProbe(
       detectedFeedbackMessage: null,
       correlation: bestCorrelation,
       structuredSignals: postClickSignals,
-      cartClearedAfterProbe: input.cartClearedAfterProbe,
+      cartClearedAfterProbe: cleanupVerification.cartClearedAfterProbe,
+      cartCleanupVerification: cleanupVerification,
       verifiedAtIso,
       extractionStatus: 'partial',
       errorMessage:
@@ -877,20 +1007,13 @@ export function evaluateSupervisedCartProbe(
     };
   }
 
-  // 5c. SKU coincidente + confirmación positiva de reserva y carrito -> IN_STOCK
-  const matchedCartCountUpdated = matchedSignals.some(
-    (s) =>
-      s.detectedCartItemCount !== null &&
-      s.detectedCartItemCount > (input.cartCountBefore ?? 0)
-  );
-  const cartUpdated =
-    input.cartSuccessConfirmedInUi ||
-    (input.cartCountBefore !== null &&
-      input.cartCountAfter !== null &&
-      input.cartCountAfter > input.cartCountBefore) ||
-    matchedCartCountUpdated;
+  // 5c. SKU coincidente + confirmación positiva de reserva + confirmación ESPECÍFICA de la variante en el carrito -> IN_STOCK
+  // IMPORTANTE: un incremento de contador general del carrito (cartCountBefore -> cartCountAfter)
+  // o un indicador genérico SIN confirmar la variante específica NO basta para IN_STOCK.
+  const variantConfirmedInCart =
+    input.cartContainsSelectedVariant || Boolean(matchedCartItemSignal);
 
-  if (matchedConfirmationSignal && cartUpdated) {
+  if (matchedConfirmationSignal && variantConfirmedInCart) {
     return {
       productId: input.productId,
       selectedVariantId: input.selectedVariantId,
@@ -904,9 +1027,40 @@ export function evaluateSupervisedCartProbe(
       detectedFeedbackMessage: null,
       correlation: bestCorrelation,
       structuredSignals: postClickSignals,
-      cartClearedAfterProbe: input.cartClearedAfterProbe,
+      cartClearedAfterProbe: cleanupVerification.cartClearedAfterProbe,
+      cartCleanupVerification: cleanupVerification,
       verifiedAtIso,
       extractionStatus: 'ok',
+    };
+  }
+
+  // 5d. Contador general del carrito aumentó pero SIN evidencia de la variante específica -> UNKNOWN
+  const onlyGenericCartCounterChanged =
+    (input.cartCountBefore !== null &&
+      input.cartCountAfter !== null &&
+      input.cartCountAfter > input.cartCountBefore) ||
+    Boolean(input.cartSuccessConfirmedInUi);
+
+  if (onlyGenericCartCounterChanged && (!matchedConfirmationSignal || !variantConfirmedInCart)) {
+    return {
+      productId: input.productId,
+      selectedVariantId: input.selectedVariantId,
+      correlatedSku: primaryMatchedSignal?.extractedSku ?? null,
+      buttonState: input.buttonState,
+      cartProbeOutcome: 'not_executed',
+      effectiveAvailability: 'unverified',
+      availabilityState: 'UNKNOWN',
+      classificationReason: 'CART_COUNTER_ONLY_UNVERIFIED',
+      shouldModifyStoredState: false,
+      detectedFeedbackMessage: null,
+      correlation: bestCorrelation,
+      structuredSignals: postClickSignals,
+      cartClearedAfterProbe: cleanupVerification.cartClearedAfterProbe,
+      cartCleanupVerification: cleanupVerification,
+      verifiedAtIso,
+      extractionStatus: 'partial',
+      errorMessage:
+        'Un contador general del carrito no es evidencia suficiente de disponibilidad para una variante específica; se requiere confirmación correlacionada de reserva y presencia de la variante.',
     };
   }
 
@@ -925,7 +1079,8 @@ export function evaluateSupervisedCartProbe(
       detectedFeedbackMessage: null,
       correlation: bestCorrelation,
       structuredSignals: postClickSignals,
-      cartClearedAfterProbe: input.cartClearedAfterProbe,
+      cartClearedAfterProbe: cleanupVerification.cartClearedAfterProbe,
+      cartCleanupVerification: cleanupVerification,
       verifiedAtIso,
       extractionStatus: 'ok',
       errorMessage: uiValidation.reason,
@@ -947,7 +1102,8 @@ export function evaluateSupervisedCartProbe(
     detectedFeedbackMessage: null,
     correlation: bestCorrelation,
     structuredSignals: postClickSignals,
-    cartClearedAfterProbe: input.cartClearedAfterProbe,
+    cartClearedAfterProbe: cleanupVerification.cartClearedAfterProbe,
+    cartCleanupVerification: cleanupVerification,
     verifiedAtIso,
     extractionStatus: 'partial',
     errorMessage:

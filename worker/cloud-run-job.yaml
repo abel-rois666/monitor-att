@@ -24,6 +24,11 @@ spec:
           serviceAccountName: att-monitor-worker-sa@PROJECT_ID.iam.gserviceaccount.com
           containers:
             - image: REGION-docker.pkg.dev/PROJECT_ID/att-price-monitor/worker:latest
+              args:
+                - "npx"
+                - "tsx"
+                - "worker/src/index.ts"
+                - "--mode=discover-readonly"
               resources:
                 limits:
                   cpu: "2"
@@ -31,6 +36,8 @@ spec:
               env:
                 - name: SCRAPER_LIVE_ENABLED
                   value: "false"
+                - name: ATT_SELECTORS_FILE
+                  value: "/app/worker/config/selectors.json"
                 - name: TARGET_CATALOG_URL
                   value: "https://www.att.com.mx/market/destacados"
                 - name: MAX_REQUESTS_PER_MINUTE

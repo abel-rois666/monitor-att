@@ -9,10 +9,14 @@ import {
   type RealObservationRecord,
 } from '../../src/scraper/contracts.ts';
 import {
+  isCartProbeSelectorsReady,
+  isCatalogSelectorsReady,
+  isProductDetailSelectorsReady,
   listMissingCartProbeSelectors,
-  listMissingDiscoverySelectors,
+  listMissingCatalogSelectors,
   listMissingPriceSelectors,
-  UNCONFIGURED_ATT_SELECTORS,
+  listMissingProductDetailSelectors,
+  loadSelectorRegistry,
 } from '../../src/scraper/selector-registry.ts';
 import {
   analyzeReadOnlyAvailability,
@@ -30,11 +34,39 @@ function parseArg(flag: string): string | null {
   return found ? found.slice(prefix.length) : null;
 }
 
+function resolveProductTargetUrl(): string {
+  const explicitUrl = parseArg('product-url');
+  if (explicitUrl) return explicitUrl;
+
+  const targetAlias = parseArg('target');
+  if (targetAlias) {
+    const matched = ATT_REFERENCE_PRODUCTS.find(
+      (p) =>
+        p.alias === targetAlias.toLowerCase() ||
+        p.productId.toLowerCase() === targetAlias.toLowerCase() ||
+        p.variantId.toLowerCase() === targetAlias.toLowerCase()
+    );
+    if (!matched) {
+      throw new Error(
+        `TARGET_NOT_FOUND: Alias "${targetAlias}" no reconocido. Usa --target=s23-ultra, --target=honor-magic6-pro o --product-url=<url>.`
+      );
+    }
+    return matched.productUrl;
+  }
+
+  return ATT_REFERENCE_PRODUCTS[0].productUrl;
+}
+
 async function main() {
   const mode = parseArg('mode') || 'status';
+  const selectorsFileArg = parseArg('selectors-file');
+  const loaded = loadSelectorRegistry({ filePath: selectorsFileArg });
+
   const adapter = new AttCrawleePlaywrightAdapter(
-    UNCONFIGURED_ATT_SELECTORS,
-    DEFAULT_COMPLIANCE_POLICY
+    loaded.registry,
+    DEFAULT_COMPLIANCE_POLICY,
+    [],
+    loaded.filePath ? `${loaded.source}:${loaded.filePath}` : loaded.source
   );
 
   if (mode === 'status') {
@@ -44,13 +76,31 @@ async function main() {
           worker: 'att-price-monitor-worker',
           stage: 2,
           scraperLiveEnabled: isScraperLiveEnabled(),
-          missingDiscoverySelectors: listMissingDiscoverySelectors(UNCONFIGURED_ATT_SELECTORS),
-          missingPriceSelectors: listMissingPriceSelectors(UNCONFIGURED_ATT_SELECTORS),
-          missingCartProbeSelectors: listMissingCartProbeSelectors(UNCONFIGURED_ATT_SELECTORS),
+          selectorConfig: {
+            source: loaded.source,
+            filePath: loaded.filePath,
+            groups: {
+              catalog: {
+                ready: isCatalogSelectorsReady(loaded.registry),
+                missing: listMissingCatalogSelectors(loaded.registry),
+              },
+              productDetail: {
+                ready: isProductDetailSelectorsReady(loaded.registry),
+                missing: listMissingProductDetailSelectors(loaded.registry),
+              },
+              cartProbe: {
+                ready: isCartProbeSelectorsReady(loaded.registry),
+                missing: listMissingCartProbeSelectors(loaded.registry),
+              },
+            },
+            missingPriceCandidateSelectors: listMissingPriceSelectors(loaded.registry),
+          },
           referenceProducts: ATT_REFERENCE_PRODUCTS.map((p) => ({
+            alias: p.alias,
             productId: p.productId,
             productName: p.productName,
             variantId: p.variantId,
+            productUrl: p.productUrl,
             verifiedSkuMappingStatus: p.verifiedSkuMappingStatus,
           })),
           diagnostics: adapter.getDiagnostics(),
@@ -62,8 +112,77 @@ async function main() {
     return;
   }
 
+  if (mode === 'inspect-product') {
+    const productUrl = resolveProductTargetUrl();
+    const result = await adapter.inspectSingleProductPriceReadOnly(productUrl);
+
+    if (result.executedNetworkRequest) {
+      const runId = `product_${Date.now()}`;
+      const obs = buildRealObservationRecord({
+        dataOrigin: 'real_extraction',
+        productId: result.productId ?? 'unknown-product',
+        productName: result.title ?? result.productId ?? 'Sin título confirmado',
+        brand: null,
+        selectedVariantId: result.selectedVariantId,
+        correlatedSku: null,
+        variantKey: [result.productId, result.selectedVariantId].filter(Boolean).join(':') || 'unknown',
+        capacity: null,
+        color: null,
+        currentPriceMxn: result.currentPriceMxn,
+        productUrl: result.productUrl,
+        availabilityState: 'UNKNOWN',
+        classificationReason: 'ENABLED_BUTTON_UNVERIFIED',
+        evidence: {
+          method: 'read_only_dom',
+          buttonState: 'not_found',
+          correlation: {
+            matched: false,
+            matchType: 'missing_sku',
+            selectedVariantId: result.selectedVariantId,
+            operationSku: null,
+            notes: 'Inspección individual de solo lectura para precios; no evalúa inventario.',
+          },
+          matchedMessages: [],
+          structuredSignals: [],
+          httpStatus: null,
+          backendStatus: null,
+          cartClearedAfterProbe: false,
+          notes: result.notes,
+        },
+        observedAtIso: result.observedAtIso,
+        extractionStatus:
+          result.hydrationStatus === 'elements_found'
+            ? 'ok'
+            : result.hydrationStatus === 'access_denied'
+              ? 'blocked'
+              : result.hydrationStatus === 'timeout'
+                ? 'timeout'
+                : result.hydrationStatus === 'network_error'
+                  ? 'error'
+                  : 'partial',
+      });
+
+      const report = buildRealExtractionRunReport({
+        dataOrigin: 'real_extraction',
+        runId,
+        mode: 'read_only_single_product',
+        targetCatalogUrl: DEFAULT_COMPLIANCE_POLICY.targetCatalogUrl,
+        startedAtIso: result.observedAtIso,
+        scraperLiveEnabled: isScraperLiveEnabled(),
+        selectorsConfigured: isProductDetailSelectorsReady(loaded.registry),
+        observations: [obs],
+      });
+      const reportPath = writeRealRunReportToDisk(report);
+      console.log(JSON.stringify({ reportPath, inspection: result }, null, 2));
+      return;
+    }
+
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
   if (mode === 'inspect-hydration') {
-    const productUrl = parseArg('product-url') || ATT_REFERENCE_PRODUCTS[0].productUrl;
+    const productUrl = resolveProductTargetUrl();
     const report = await adapter.inspectProductHydrationReadOnly(productUrl);
     console.log(JSON.stringify(report, null, 2));
     return;
@@ -76,7 +195,6 @@ async function main() {
     const discovery = await adapter.discoverProducts(DEFAULT_COMPLIANCE_POLICY.targetCatalogUrl);
     const observations: RealObservationRecord[] = discovery.products.map((product) => {
       const primaryVariant = product.variants[0];
-      // En modo solo lectura jamás se clasifica IN_STOCK ni OUT_OF_STOCK sin evidencia correlacionada
       const analysis = analyzeReadOnlyAvailability({
         productId: product.productId,
         selectedVariantId: primaryVariant?.variantId ?? null,
@@ -114,7 +232,7 @@ async function main() {
       targetCatalogUrl: DEFAULT_COMPLIANCE_POLICY.targetCatalogUrl,
       startedAtIso,
       scraperLiveEnabled: isScraperLiveEnabled(),
-      selectorsConfigured: UNCONFIGURED_ATT_SELECTORS.configured,
+      selectorsConfigured: isCatalogSelectorsReady(loaded.registry),
       observations,
     });
 
@@ -186,8 +304,9 @@ async function main() {
         httpStatus: primarySignal?.httpStatus ?? null,
         backendStatus: primarySignal?.backendStatus ?? null,
         cartClearedAfterProbe: probeResult.cartClearedAfterProbe,
+        cartCleanupVerification: probeResult.cartCleanupVerification,
         notes:
-          'Resultado de sonda supervisada sobre una única variante autorizada con correlación de SKU.',
+          'Resultado de sonda supervisada sobre una única variante autorizada con correlación de SKU y limpieza verificada.',
       },
       observedAtIso: probeResult.verifiedAtIso,
       extractionStatus: probeResult.extractionStatus,
@@ -201,7 +320,7 @@ async function main() {
       targetCatalogUrl: DEFAULT_COMPLIANCE_POLICY.targetCatalogUrl,
       startedAtIso,
       scraperLiveEnabled: isScraperLiveEnabled(),
-      selectorsConfigured: UNCONFIGURED_ATT_SELECTORS.configured,
+      selectorsConfigured: isCartProbeSelectorsReady(loaded.registry),
       observations: [observation],
     });
 
@@ -211,7 +330,7 @@ async function main() {
   }
 
   throw new Error(
-    `Modo no reconocido: ${mode}. Usa status | inspect-hydration | discover-readonly | supervised-cart-probe.`
+    `Modo no reconocido: ${mode}. Usa status | inspect-product | inspect-hydration | discover-readonly | supervised-cart-probe.`
   );
 }
 

@@ -5,12 +5,15 @@ import {
   ATT_OUT_OF_STOCK_PHRASE,
   DEFAULT_COMPLIANCE_POLICY,
   type CartAvailabilityVerifier,
+  type CartCleanupVerification,
   type CartVerificationResult,
   type CatalogDiscoveryAdapter,
   type CatalogDiscoveryResult,
   type ComplianceGuardConfig,
   type DiscoveredProductRef,
   type ExtractionStatus,
+  type HydrationOutcomeStatus,
+  type SingleProductPriceInspectionReport,
   type StructuredNetworkSignal,
   type SupervisedProbeAuthorization,
   type UiFeedbackObservation,
@@ -18,8 +21,15 @@ import {
 } from './contracts.ts';
 import {
   assertCartProbeSelectorsConfigured,
-  assertDiscoverySelectorsConfigured,
+  assertCatalogSelectorsConfigured,
+  assertProductDetailSelectorsConfigured,
+  isCartProbeSelectorsReady,
+  isCatalogSelectorsReady,
+  isProductDetailSelectorsReady,
+  listMissingCartProbeSelectors,
+  listMissingCatalogSelectors,
   listMissingPriceSelectors,
+  listMissingProductDetailSelectors,
   UNCONFIGURED_ATT_SELECTORS,
   type AttSelectorRegistry,
 } from './selector-registry.ts';
@@ -28,6 +38,7 @@ import {
   evaluateSupervisedCartProbe,
   extractAttProductIdentifiersFromUrl,
   inspectStructuredNetworkPayload,
+  verifyCartCleanupResult,
 } from './availability-analyzer.ts';
 import { parseMxnPrice } from './result-store.ts';
 import type { AddToCartButtonState } from '../shared/types.ts';
@@ -39,7 +50,8 @@ import type { AddToCartButtonState } from '../shared/types.ts';
  * - SCRAPER_LIVE_ENABLED tiene valor predeterminado false (process.env.SCRAPER_LIVE_ENABLED === 'true').
  * - No invoca endpoints internos de AT&T directamente ni evade controles de seguridad.
  * - No realiza compras, checkout ni reintentos repetitivos de carrito.
- * - Correlaciona variante, SKU, marca temporal posterior al clic y mensaje visible de la misma interacción.
+ * - Valida selectores en 3 grupos independientes: catalog, productDetail y cartProbe.
+ * - Verifica explícitamente la desaparición de la variante antes de marcar cartClearedAfterProbe=true.
  */
 export function isScraperLiveEnabled(): boolean {
   return process.env.SCRAPER_LIVE_ENABLED === 'true';
@@ -60,15 +72,138 @@ function detectCapacityTokens(text: string): string[] {
   return Array.from(new Set(matches.map((m) => m.replace(/\s+/g, ' ').toUpperCase())));
 }
 
+export interface HydrationClassificationInput {
+  readonly httpStatus: number | null;
+  readonly pageTitle: string;
+  readonly bodySnippet?: string;
+  readonly navigationTimedOut?: boolean;
+  readonly networkErrorMessage?: string | null;
+  readonly titleVisible: boolean;
+  readonly priceVisible: boolean;
+  readonly pricingAreaVisible?: boolean;
+  readonly skeletonOrLoadingVisible?: boolean;
+  readonly nextRootEmpty?: boolean;
+  readonly networkIdleTimedOut?: boolean;
+}
+
+/**
+ * Clasifica de forma determinista el resultado del diagnóstico de hidratación de una ficha:
+ * - `access_denied`: HTTP 403/429 o página de control de acceso ("Solicitud rechazada", etc.)
+ * - `timeout`: timeout de navegación o espera
+ * - `network_error`: error de red / conexión o HTTP >= 400 distinto de acceso rechazado
+ * - `elements_found`: título Y precio ambos visibles
+ * - `incomplete_hydration`: solo uno apareció, hay skeletons/loading visibles, __next vacío o networkidle expiró sin ambos elementos
+ * - `loaded_no_matches`: página cargada e hidratada sin coincidencias visibles en los selectores
+ */
+export function classifyHydrationOutcome(
+  input: HydrationClassificationInput
+): { status: HydrationOutcomeStatus; reason: string } {
+  const combinedText = `${input.pageTitle} ${input.bodySnippet ?? ''}`;
+  const looksBlockedByText =
+    /solicitud rechazada|access denied|request rejected|forbidden|bot protection/i.test(
+      combinedText
+    );
+
+  if (
+    input.httpStatus === 403 ||
+    input.httpStatus === 429 ||
+    looksBlockedByText
+  ) {
+    return {
+      status: 'access_denied',
+      reason: `Acceso rechazado por el sitio (HTTP ${input.httpStatus ?? 'N/A'}, título: "${input.pageTitle || 'vacío'}"). No se eluden controles de acceso.`,
+    };
+  }
+
+  if (input.navigationTimedOut) {
+    return {
+      status: 'timeout',
+      reason: input.networkErrorMessage || 'Tiempo de espera agotado durante la carga o hidratación.',
+    };
+  }
+
+  if (input.networkErrorMessage) {
+    return {
+      status: 'network_error',
+      reason: input.networkErrorMessage,
+    };
+  }
+
+  if (input.httpStatus !== null && input.httpStatus >= 400) {
+    return {
+      status: 'network_error',
+      reason: `Respuesta HTTP no satisfactoria (${input.httpStatus}).`,
+    };
+  }
+
+  // Exige AMBOS: título visible Y precio visible (no basta que aparezca solo un candidato)
+  if (input.titleVisible && input.priceVisible) {
+    return {
+      status: 'elements_found',
+      reason: 'Navegación exitosa con título y precio visibles confirmados en el DOM hidratado.',
+    };
+  }
+
+  const partialMatch =
+    input.titleVisible !== input.priceVisible || Boolean(input.pricingAreaVisible);
+
+  if (
+    partialMatch ||
+    input.skeletonOrLoadingVisible ||
+    input.nextRootEmpty ||
+    input.networkIdleTimedOut
+  ) {
+    const details: string[] = [];
+    if (input.titleVisible && !input.priceVisible) details.push('título visible pero precio ausente');
+    if (!input.titleVisible && input.priceVisible) details.push('precio visible pero título ausente');
+    if (input.pricingAreaVisible && (!input.titleVisible || !input.priceVisible)) {
+      details.push('pricingArea presente sin título y precio completos');
+    }
+    if (input.skeletonOrLoadingVisible) details.push('indicadores skeleton/loading activos');
+    if (input.nextRootEmpty) details.push('contenedor raíz hidratado vacío');
+    if (input.networkIdleTimedOut) details.push('networkidle agotado');
+
+    return {
+      status: 'incomplete_hydration',
+      reason: `Hidratación incompleta: ${details.join('; ')}.`,
+    };
+  }
+
+  return {
+    status: 'loaded_no_matches',
+    reason:
+      'Página cargada sin bloqueo ni skeletons activos, pero los selectores de título y precio no produjeron coincidencias visibles.',
+  };
+}
+
 export interface HydrationDiagnosticReport {
   readonly productUrl: string;
+  readonly outcomeStatus: HydrationOutcomeStatus;
+  readonly outcomeReason: string;
   readonly httpStatus: number | null;
   readonly pageTitle: string;
   readonly blockedByAccessControl: boolean;
+  readonly titleVisible: boolean;
+  readonly priceVisible: boolean;
+  readonly extractedTitle: string | null;
+  readonly extractedRawPrice: string | null;
+  readonly extractedPriceMxn: number | null;
+  readonly skeletonOrLoadingDetected: boolean;
+  readonly networkIdleTimedOut: boolean;
   readonly candidateMatches: {
-    readonly title: { selector: string; count: number; sampleText: string | null };
-    readonly currentPrice: { selector: string; count: number; sampleText: string | null };
-    readonly pricingArea: { selector: string; count: number; sampleText: string | null };
+    readonly title: { selector: string; count: number; visible: boolean; sampleText: string | null };
+    readonly currentPrice: {
+      selector: string;
+      count: number;
+      visible: boolean;
+      sampleText: string | null;
+    };
+    readonly pricingArea: {
+      selector: string;
+      count: number;
+      visible: boolean;
+      sampleText: string | null;
+    };
   };
   readonly iframeCount: number;
   readonly observedAtIso: string;
@@ -80,25 +215,52 @@ export class AttCrawleePlaywrightAdapter
   private readonly selectors: AttSelectorRegistry;
   private readonly policy: ComplianceGuardConfig;
   private readonly verifiedBundleMappings: readonly VerifiedBundleSkuMapping[];
+  private readonly selectorSourceLabel: string;
 
   constructor(
     selectors: AttSelectorRegistry = UNCONFIGURED_ATT_SELECTORS,
     policy: ComplianceGuardConfig = DEFAULT_COMPLIANCE_POLICY,
-    verifiedBundleMappings: readonly VerifiedBundleSkuMapping[] = []
+    verifiedBundleMappings: readonly VerifiedBundleSkuMapping[] = [],
+    selectorSourceLabel: string = 'default_unconfigured'
   ) {
     this.selectors = selectors;
     this.policy = policy;
     this.verifiedBundleMappings = verifiedBundleMappings;
+    this.selectorSourceLabel = selectorSourceLabel;
   }
 
   public getDiagnostics() {
     const liveFlag = isScraperLiveEnabled();
+    const catalogReady = isCatalogSelectorsReady(this.selectors);
+    const productDetailReady = isProductDetailSelectorsReady(this.selectors);
+    const cartProbeReady = isCartProbeSelectorsReady(this.selectors);
+
     return {
       adapterName: 'AttCrawleePlaywrightAdapter',
       executionRuntime: 'Cloud Run Job (Crawlee + Playwright)',
       scraperLiveEnabled: liveFlag,
-      readyForLiveExecution: this.selectors.configured && liveFlag,
+      selectorSource: this.selectorSourceLabel,
+      readyForLiveExecution: catalogReady && liveFlag,
+      readyForSingleProductInspection: productDetailReady && liveFlag,
+      readyForSupervisedCartProbe: cartProbeReady && liveFlag,
       selectorsConfigured: this.selectors.configured,
+      selectorGroups: {
+        catalog: {
+          ready: catalogReady,
+          validation: this.selectors.groups.catalog,
+          missing: listMissingCatalogSelectors(this.selectors),
+        },
+        productDetail: {
+          ready: productDetailReady,
+          validation: this.selectors.groups.productDetail,
+          missing: listMissingProductDetailSelectors(this.selectors),
+        },
+        cartProbe: {
+          ready: cartProbeReady,
+          validation: this.selectors.groups.cartProbe,
+          missing: listMissingCartProbeSelectors(this.selectors),
+        },
+      },
       priceSelectorsPendingValidation: listMissingPriceSelectors(this.selectors),
       priceCandidateSelectors: this.selectors.priceCandidates,
       policy: this.policy,
@@ -108,16 +270,97 @@ export class AttCrawleePlaywrightAdapter
   }
 
   /**
-   * Inspección de solo lectura de selectores candidatos de precio tras hidratación de Next.js
-   * (sin reservas de carrito ni llamadas directas a endpoints internos).
-   * Requiere SCRAPER_LIVE_ENABLED === 'true' cuando se autorice su ejecución en un entorno con Chromium.
+   * Preflight sin tráfico de red para una inspección individual de ficha y precio.
+   * Valida únicamente el grupo `productDetail` (independiente de `catalog` y `cartProbe`).
+   */
+  public preflightSingleProductInspection(
+    productUrl: string
+  ): SingleProductPriceInspectionReport {
+    const ids = extractAttProductIdentifiersFromUrl(productUrl);
+    const missingDetail = listMissingProductDetailSelectors(this.selectors);
+    const liveEnabled = isScraperLiveEnabled();
+
+    if (missingDetail.length > 0) {
+      return {
+        mode: 'read_only_single_product',
+        executedNetworkRequest: false,
+        productUrl,
+        productId: ids.productId,
+        selectedVariantId: ids.variantId,
+        title: null,
+        rawPriceText: null,
+        currentPriceMxn: null,
+        availabilityState: 'UNKNOWN',
+        hydrationStatus: 'not_executed',
+        blockedByConfiguration: true,
+        blockedReason: 'PRODUCT_DETAIL_SELECTORS_PENDING',
+        missingProductDetailSelectors: missingDetail,
+        selectorSource: this.selectorSourceLabel,
+        observedAtIso: new Date().toISOString(),
+        notes: `Inspección bloqueada antes de consultar AT&T: faltan selectores validados del grupo "productDetail" (${missingDetail.join(', ')}). El grupo "catalog" NO es requerido para esta prueba.`,
+      };
+    }
+
+    if (!liveEnabled) {
+      return {
+        mode: 'read_only_single_product',
+        executedNetworkRequest: false,
+        productUrl,
+        productId: ids.productId,
+        selectedVariantId: ids.variantId,
+        title: null,
+        rawPriceText: null,
+        currentPriceMxn: null,
+        availabilityState: 'UNKNOWN',
+        hydrationStatus: 'not_executed',
+        blockedByConfiguration: true,
+        blockedReason: 'LIVE_SCRAPING_DISABLED',
+        missingProductDetailSelectors: [],
+        selectorSource: this.selectorSourceLabel,
+        observedAtIso: new Date().toISOString(),
+        notes:
+          'Los selectores del grupo "productDetail" están configurados, pero SCRAPER_LIVE_ENABLED es false. No se ejecutó tráfico real.',
+      };
+    }
+
+    return {
+      mode: 'read_only_single_product',
+      executedNetworkRequest: false,
+      productUrl,
+      productId: ids.productId,
+      selectedVariantId: ids.variantId,
+      title: null,
+      rawPriceText: null,
+      currentPriceMxn: null,
+      availabilityState: 'UNKNOWN',
+      hydrationStatus: 'not_executed',
+      blockedByConfiguration: false,
+      blockedReason: null,
+      missingProductDetailSelectors: [],
+      selectorSource: this.selectorSourceLabel,
+      observedAtIso: new Date().toISOString(),
+      notes: 'Preflight aprobado para ejecutar inspección de solo lectura en ficha individual.',
+    };
+  }
+
+  /**
+   * Diagnóstico de hidratación de solo lectura en una ficha individual.
+   * Espera explícitamente a que TANTO el título COMO el precio sean visibles (`state: 'visible'`),
+   * y clasifica el resultado en los 6 estados definidos por `HydrationOutcomeStatus`.
+   * Requiere SCRAPER_LIVE_ENABLED === 'true'.
    */
   public async inspectProductHydrationReadOnly(
     productUrl: string
   ): Promise<HydrationDiagnosticReport> {
     this.ensureLiveExecutionAllowed();
 
-    const candidates = this.selectors.priceCandidates;
+    const titleSelector =
+      this.selectors.productDetail.titleElement ?? this.selectors.priceCandidates.title.selector;
+    const priceSelector =
+      this.selectors.productDetail.priceElement ??
+      this.selectors.priceCandidates.currentPrice.selector;
+    const pricingAreaSelector = this.selectors.priceCandidates.pricingArea.selector;
+
     let report: HydrationDiagnosticReport | null = null;
     const crawlerConfig = new Configuration({ persistStorage: false });
 
@@ -129,41 +372,165 @@ export class AttCrawleePlaywrightAdapter
         navigationTimeoutSecs: Math.ceil(this.policy.navigationTimeoutMs / 1000),
         requestHandler: async ({ page, response }) => {
           const httpStatus = response?.status() ?? null;
-          await page.waitForLoadState('networkidle', { timeout: 15_000 }).catch(() => {});
-          // Espera conservadora para hidratación del árbol cliente de Next.js (sin bucles agresivos)
-          await page
-            .waitForSelector(
-              `${candidates.title.selector}, ${candidates.currentPrice.selector}, ${candidates.pricingArea.selector}`,
-              { state: 'attached', timeout: 8_000 }
-            )
-            .catch(() => {});
+          let networkIdleTimedOut = false;
+
+          await page.waitForLoadState('domcontentloaded', { timeout: 12_000 }).catch(() => {});
+          await page.waitForLoadState('networkidle', { timeout: 15_000 }).catch(() => {
+            networkIdleTimedOut = true;
+          });
 
           const pageTitle = await page.title().catch(() => '');
-          const blocked =
-            (httpStatus !== null && (httpStatus === 403 || httpStatus === 429)) ||
-            /solicitud rechazada|access denied/i.test(pageTitle);
+          const bodySnippet = (
+            await page.evaluate(() => (document.body?.innerText || '').slice(0, 600)).catch(() => '')
+          ).trim();
 
-          const inspectCandidate = async (selector: string) => {
+          // Si el sitio ya devolvió bloqueo o error HTTP, detener inmediatamente sin eludir controles
+          const preCheck = classifyHydrationOutcome({
+            httpStatus,
+            pageTitle,
+            bodySnippet,
+            titleVisible: false,
+            priceVisible: false,
+          });
+
+          if (preCheck.status === 'access_denied' || preCheck.status === 'network_error') {
+            report = {
+              productUrl,
+              outcomeStatus: preCheck.status,
+              outcomeReason: preCheck.reason,
+              httpStatus,
+              pageTitle,
+              blockedByAccessControl: preCheck.status === 'access_denied',
+              titleVisible: false,
+              priceVisible: false,
+              extractedTitle: null,
+              extractedRawPrice: null,
+              extractedPriceMxn: null,
+              skeletonOrLoadingDetected: false,
+              networkIdleTimedOut,
+              candidateMatches: {
+                title: { selector: titleSelector, count: 0, visible: false, sampleText: null },
+                currentPrice: { selector: priceSelector, count: 0, visible: false, sampleText: null },
+                pricingArea: {
+                  selector: pricingAreaSelector,
+                  count: 0,
+                  visible: false,
+                  sampleText: null,
+                },
+              },
+              iframeCount: Math.max(0, page.frames().length - 1),
+              observedAtIso: new Date().toISOString(),
+            };
+            return;
+          }
+
+          // Esperar ESPECÍFICAMENTE a que TANTO el título COMO el precio sean visibles
+          await Promise.allSettled([
+            page.locator(titleSelector).first().waitFor({ state: 'visible', timeout: 8_000 }),
+            page.locator(priceSelector).first().waitFor({ state: 'visible', timeout: 8_000 }),
+          ]);
+
+          const inspectLocator = async (selector: string) => {
             const loc = page.locator(selector);
             const count = await loc.count().catch(() => 0);
+            const visible = count > 0 ? await loc.first().isVisible().catch(() => false) : false;
             const sampleText =
-              count > 0
-                ? (await loc.first().textContent().catch(() => null))?.trim().slice(0, 120) ?? null
+              count > 0 && visible
+                ? (await loc.first().textContent().catch(() => null))?.trim().slice(0, 160) ?? null
                 : null;
-            return { selector, count, sampleText };
+            return { selector, count, visible, sampleText };
           };
+
+          const titleMatch = await inspectLocator(titleSelector);
+          const priceMatch = await inspectLocator(priceSelector);
+          const pricingAreaMatch = await inspectLocator(pricingAreaSelector);
+
+          const domSignals = await page
+            .evaluate(() => {
+              const nextRoot = document.querySelector('#__next, main');
+              const nextRootEmpty = nextRoot ? (nextRoot.textContent || '').trim().length < 20 : false;
+              const skeletonNodes = document.querySelectorAll(
+                '[class*="skeleton" i], [class*="shimmer" i], [aria-busy="true"]'
+              );
+              const skeletonOrLoadingVisible = Array.from(skeletonNodes).some((el) => {
+                const rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+              });
+              return { nextRootEmpty, skeletonOrLoadingVisible };
+            })
+            .catch(() => ({ nextRootEmpty: false, skeletonOrLoadingVisible: false }));
+
+          const outcome = classifyHydrationOutcome({
+            httpStatus,
+            pageTitle,
+            bodySnippet,
+            titleVisible: titleMatch.visible && Boolean(titleMatch.sampleText),
+            priceVisible: priceMatch.visible && Boolean(priceMatch.sampleText),
+            pricingAreaVisible: pricingAreaMatch.visible,
+            skeletonOrLoadingVisible: domSignals.skeletonOrLoadingVisible,
+            nextRootEmpty: domSignals.nextRootEmpty,
+            networkIdleTimedOut,
+          });
 
           report = {
             productUrl,
+            outcomeStatus: outcome.status,
+            outcomeReason: outcome.reason,
             httpStatus,
             pageTitle,
-            blockedByAccessControl: blocked,
+            blockedByAccessControl: outcome.status === 'access_denied',
+            titleVisible: titleMatch.visible,
+            priceVisible: priceMatch.visible,
+            extractedTitle: titleMatch.visible ? titleMatch.sampleText : null,
+            extractedRawPrice: priceMatch.visible ? priceMatch.sampleText : null,
+            extractedPriceMxn: priceMatch.visible ? parseMxnPrice(priceMatch.sampleText) : null,
+            skeletonOrLoadingDetected: domSignals.skeletonOrLoadingVisible,
+            networkIdleTimedOut,
             candidateMatches: {
-              title: await inspectCandidate(candidates.title.selector),
-              currentPrice: await inspectCandidate(candidates.currentPrice.selector),
-              pricingArea: await inspectCandidate(candidates.pricingArea.selector),
+              title: titleMatch,
+              currentPrice: priceMatch,
+              pricingArea: pricingAreaMatch,
             },
-            iframeCount: page.frames().length - 1,
+            iframeCount: Math.max(0, page.frames().length - 1),
+            observedAtIso: new Date().toISOString(),
+          };
+        },
+        failedRequestHandler: async ({ error }) => {
+          const msg = error instanceof Error ? error.message : String(error);
+          const timedOut = /timeout/i.test(msg);
+          const outcome = classifyHydrationOutcome({
+            httpStatus: null,
+            pageTitle: '',
+            navigationTimedOut: timedOut,
+            networkErrorMessage: msg,
+            titleVisible: false,
+            priceVisible: false,
+          });
+          report = {
+            productUrl,
+            outcomeStatus: outcome.status,
+            outcomeReason: outcome.reason,
+            httpStatus: null,
+            pageTitle: '',
+            blockedByAccessControl: false,
+            titleVisible: false,
+            priceVisible: false,
+            extractedTitle: null,
+            extractedRawPrice: null,
+            extractedPriceMxn: null,
+            skeletonOrLoadingDetected: false,
+            networkIdleTimedOut: timedOut,
+            candidateMatches: {
+              title: { selector: titleSelector, count: 0, visible: false, sampleText: null },
+              currentPrice: { selector: priceSelector, count: 0, visible: false, sampleText: null },
+              pricingArea: {
+                selector: pricingAreaSelector,
+                count: 0,
+                visible: false,
+                sampleText: null,
+              },
+            },
+            iframeCount: 0,
             observedAtIso: new Date().toISOString(),
           };
         },
@@ -176,13 +543,27 @@ export class AttCrawleePlaywrightAdapter
     return (
       report ?? {
         productUrl,
+        outcomeStatus: 'network_error',
+        outcomeReason: 'La inspección de hidratación finalizó sin respuesta de navegador.',
         httpStatus: null,
         pageTitle: '',
         blockedByAccessControl: false,
+        titleVisible: false,
+        priceVisible: false,
+        extractedTitle: null,
+        extractedRawPrice: null,
+        extractedPriceMxn: null,
+        skeletonOrLoadingDetected: false,
+        networkIdleTimedOut: false,
         candidateMatches: {
-          title: { selector: candidates.title.selector, count: 0, sampleText: null },
-          currentPrice: { selector: candidates.currentPrice.selector, count: 0, sampleText: null },
-          pricingArea: { selector: candidates.pricingArea.selector, count: 0, sampleText: null },
+          title: { selector: titleSelector, count: 0, visible: false, sampleText: null },
+          currentPrice: { selector: priceSelector, count: 0, visible: false, sampleText: null },
+          pricingArea: {
+            selector: pricingAreaSelector,
+            count: 0,
+            visible: false,
+            sampleText: null,
+          },
         },
         iframeCount: 0,
         observedAtIso: new Date().toISOString(),
@@ -191,14 +572,55 @@ export class AttCrawleePlaywrightAdapter
   }
 
   /**
+   * Inspección individual de solo lectura para extraer título, precio actual, variante y URL.
+   * Requiere ÚNICAMENTE el grupo `productDetail` validado (no requiere `catalog` ni `cartProbe`)
+   * y `SCRAPER_LIVE_ENABLED === 'true'`.
+   */
+  public async inspectSingleProductPriceReadOnly(
+    productUrl: string
+  ): Promise<SingleProductPriceInspectionReport> {
+    const preflight = this.preflightSingleProductInspection(productUrl);
+    if (preflight.blockedByConfiguration) {
+      return preflight;
+    }
+
+    assertProductDetailSelectorsConfigured(this.selectors);
+    this.ensureLiveExecutionAllowed();
+
+    const hydration = await this.inspectProductHydrationReadOnly(productUrl);
+    const ids = extractAttProductIdentifiersFromUrl(productUrl);
+
+    return {
+      mode: 'read_only_single_product',
+      executedNetworkRequest: true,
+      productUrl,
+      productId: ids.productId,
+      selectedVariantId: ids.variantId,
+      title: hydration.outcomeStatus === 'elements_found' ? hydration.extractedTitle : null,
+      rawPriceText: hydration.outcomeStatus === 'elements_found' ? hydration.extractedRawPrice : null,
+      currentPriceMxn:
+        hydration.outcomeStatus === 'elements_found' ? hydration.extractedPriceMxn : null,
+      availabilityState: 'UNKNOWN',
+      hydrationStatus: hydration.outcomeStatus,
+      blockedByConfiguration: false,
+      blockedReason: hydration.blockedByAccessControl ? 'ACCESS_DENIED' : null,
+      missingProductDetailSelectors: [],
+      selectorSource: this.selectorSourceLabel,
+      observedAtIso: hydration.observedAtIso,
+      notes: hydration.outcomeReason,
+    };
+  }
+
+  /**
    * Fase A: Descubrimiento de solo lectura sobre https://www.att.com.mx/market/destacados.
+   * Valida únicamente el grupo `catalog`.
    */
   public async discoverProducts(
     catalogUrl: string = this.policy.targetCatalogUrl
   ): Promise<CatalogDiscoveryResult> {
     const startedAtIso = new Date().toISOString();
     this.ensureLiveExecutionAllowed();
-    assertDiscoverySelectorsConfigured(this.selectors);
+    assertCatalogSelectorsConfigured(this.selectors);
 
     const discovered: DiscoveredProductRef[] = [];
     const warnings: string[] = [];
@@ -352,8 +774,8 @@ export class AttCrawleePlaywrightAdapter
 
   /**
    * Fase B: Prueba supervisada sobre UNA única variante autorizada con correlación de SKU,
-   * aislamiento temporal (ignora sincronizaciones de carrito previo) y validación contextual
-   * del mensaje "Este producto se agotó".
+   * confirmación específica de variante en carrito (no solo contador general) y verificación
+   * obligatoria de desaparición de la variante antes de reportar `cartClearedAfterProbe=true`.
    */
   public async verifySingleVariantSupervised(
     authorization: SupervisedProbeAuthorization
@@ -384,10 +806,10 @@ export class AttCrawleePlaywrightAdapter
               interactionStartedAtMs: Date.now(),
               buttonState: 'not_found',
               uiFeedback: null,
+              cartContainsSelectedVariant: false,
               cartSuccessConfirmedInUi: false,
               cartCountBefore: null,
               cartCountAfter: null,
-              cartClearedAfterProbe: false,
               structuredSignals,
               verifiedBundleMappings: verifiedMappings,
               httpStatus: navStatus,
@@ -436,10 +858,10 @@ export class AttCrawleePlaywrightAdapter
               interactionStartedAtMs: Date.now(),
               buttonState,
               uiFeedback: null,
+              cartContainsSelectedVariant: false,
               cartSuccessConfirmedInUi: false,
               cartCountBefore: null,
               cartCountAfter: null,
-              cartClearedAfterProbe: false,
               structuredSignals,
               verifiedBundleMappings: verifiedMappings,
               httpStatus: navStatus ?? 200,
@@ -458,7 +880,29 @@ export class AttCrawleePlaywrightAdapter
             return digits ? Number(digits) : null;
           };
 
-          // Verifica si el texto ya existía visible ANTES del clic para no confundirlo con un aviso nuevo
+          const checkVariantPresentInCart = async (): Promise<boolean> => {
+            if (!selectors.cartProbe.cartItemVariantLocator) return false;
+            const loc = page.locator(selectors.cartProbe.cartItemVariantLocator);
+            const count = await loc.count().catch(() => 0);
+            if (count === 0) return false;
+            for (let i = 0; i < count; i++) {
+              const item = loc.nth(i);
+              const visible = await item.isVisible().catch(() => false);
+              if (!visible) continue;
+              const text = (await item.textContent().catch(() => '')) || '';
+              const dataAttr = (await item.getAttribute('data-variant-id').catch(() => '')) || '';
+              const dataSku = (await item.getAttribute('data-sku').catch(() => '')) || '';
+              const hay = `${text} ${dataAttr} ${dataSku}`.toUpperCase();
+              if (
+                hay.includes(authorization.selectedVariantId.toUpperCase()) ||
+                hay.includes(authorization.productId.toUpperCase())
+              ) {
+                return true;
+              }
+            }
+            return false;
+          };
+
           const preClickPhraseVisible = await page
             .getByText(ATT_OUT_OF_STOCK_PHRASE, { exact: false })
             .first()
@@ -512,18 +956,29 @@ export class AttCrawleePlaywrightAdapter
                 .catch(() => false)
             : false;
 
-          let cartClearedAfterProbe = false;
-          if (
-            (cartSuccessConfirmedInUi ||
-              (cartCountBefore !== null &&
-                cartCountAfter !== null &&
-                cartCountAfter > cartCountBefore)) &&
-            selectors.cartProbe.removeFromCartButton
-          ) {
+          const variantPresentBeforeRemoval = await checkVariantPresentInCart();
+
+          // Limpieza verificada: jamás se marca cartClearedAfterProbe=true por el mero clic;
+          // se comprueba explícitamente que la variante desapareció del carrito tras eliminarla.
+          let cartCleanup: CartCleanupVerification = verifyCartCleanupResult({
+            removalAttempted: false,
+            variantPresentBeforeRemoval,
+            variantPresentAfterRemoval: null,
+            removalApiConfirmed: false,
+          });
+
+          if (variantPresentBeforeRemoval && selectors.cartProbe.removeFromCartButton) {
             const removeBtn = page.locator(selectors.cartProbe.removeFromCartButton).first();
             if (await removeBtn.isVisible().catch(() => false)) {
               await removeBtn.click({ timeout: 5_000 }).catch(() => {});
-              cartClearedAfterProbe = true;
+              await page.waitForTimeout(2_000);
+              const stillPresent = await checkVariantPresentInCart();
+              cartCleanup = verifyCartCleanupResult({
+                removalAttempted: true,
+                variantPresentBeforeRemoval,
+                variantPresentAfterRemoval: stillPresent,
+                removalApiConfirmed: false,
+              });
             }
           }
 
@@ -533,10 +988,11 @@ export class AttCrawleePlaywrightAdapter
             interactionStartedAtMs,
             buttonState: 'enabled',
             uiFeedback,
+            cartContainsSelectedVariant: variantPresentBeforeRemoval,
             cartSuccessConfirmedInUi,
             cartCountBefore,
             cartCountAfter,
-            cartClearedAfterProbe,
+            cartCleanup,
             structuredSignals,
             verifiedBundleMappings: verifiedMappings,
             httpStatus: navStatus ?? 200,
@@ -550,10 +1006,10 @@ export class AttCrawleePlaywrightAdapter
             interactionStartedAtMs: Date.now(),
             buttonState: 'not_found',
             uiFeedback: null,
+            cartContainsSelectedVariant: false,
             cartSuccessConfirmedInUi: false,
             cartCountBefore: null,
             cartCountAfter: null,
-            cartClearedAfterProbe: false,
             structuredSignals,
             verifiedBundleMappings: verifiedMappings,
             error: {
@@ -577,10 +1033,10 @@ export class AttCrawleePlaywrightAdapter
         interactionStartedAtMs: Date.now(),
         buttonState: 'not_found',
         uiFeedback: null,
+        cartContainsSelectedVariant: false,
         cartSuccessConfirmedInUi: false,
         cartCountBefore: null,
         cartCountAfter: null,
-        cartClearedAfterProbe: false,
         structuredSignals,
         verifiedBundleMappings: verifiedMappings,
         error: {

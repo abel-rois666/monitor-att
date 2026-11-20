@@ -13,7 +13,8 @@
     "lint:rules": "eslint firestore.rules",
     "test": "vitest run src/scraper/__tests__",
     "test:rules": "firebase emulators:exec --only firestore \"npx vitest run firestore.rules.test.ts\"",
-    "worker:status": "tsx worker/src/index.ts --mode=status"
+    "worker:status": "tsx worker/src/index.ts --mode=status",
+    "worker:inspect-product": "tsx worker/src/index.ts --mode=inspect-product"
   },
   "dependencies": {
     "@firebase/eslint-plugin-security-rules": "^0.0.2",
